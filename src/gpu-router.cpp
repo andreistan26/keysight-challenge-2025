@@ -16,19 +16,44 @@
 constexpr size_t burst_size = 8;
 constexpr size_t packet_size = 1518;
 
+enum Types {
+	UNKNOWN = 0,
+	IPV4,
+	IPV6,
+	TCP,
+	UDP,
+	ICMP,
+	ARP
+};
+
 using Packet = std::array<uint8_t, packet_size>;
 using PacketBurst = std::array<Packet *, burst_size>;
+using PacketTypes = std::array<Types, burst_size>;
 
 struct CaptureContext {
+	PacketTypes types;
     PacketBurst burst;
     std::array<uint32_t, burst_size> packet_lengths;
     size_t count;
 
+
     CaptureContext() : count(0) {
+		std::fill(types.begin(), types.end(), UNKNOWN);
         for (size_t i = 0; i < burst_size; ++i) {
             burst[i] = new Packet();
         }
     }
+
+	void push_back(Packet *packet) {
+		if (count < burst_size) {
+			burst[count] = packet;
+			count++;
+		}
+	}
+
+	size_t size() const {
+		return count;
+	}
 };
 
 void print_ip(Packet packet) {
@@ -115,10 +140,97 @@ int main(int argc, char *argv[]) {
             return context;
         }};
 
-    tbb::flow::function_node<CaptureContext, Counters> inspect_packet_node{
+	tbb::flow::function_node<CaptureContext, CaptureContext> parse_packet_node {
+		g,
+		tbb::flow::unlimited,
+		[&](const CaptureContext &context) -> CaptureContext {
+			if (context.count == 0) {
+				return context;
+			}
+
+            try {
+				sycl::queue q(sycl::gpu_selector_v, dpc_common::exception_handler);
+                sycl::buffer<Packet *> packets_buf(context.burst.data(), context.count);
+                sycl::buffer<uint32_t> lengths_buf(context.packet_lengths.data(), context.count);
+				sycl::buffer<Types> types_buf(context.types.data(), context.count);
+
+                q.submit([&](sycl::handler &h) {
+                    auto packets = packets_buf.get_access<sycl::access::mode::read>(h);
+                    auto lengths = lengths_buf.get_access<sycl::access::mode::read>(h);
+					auto types = types_buf.get_access<sycl::access::mode::read_write>(h);
+
+                    h.parallel_for(sycl::range<1>(context.count), [=](sycl::id<1> idx) {
+                        uint8_t *packet = packets[idx]->data();
+                        uint32_t length = lengths[idx];
+                        
+                        if (length >= 14) {
+                            uint16_t ether_type = (packet[12] << 8) | packet[13];
+                            
+                            if (ether_type == 0x0806) {
+								types[idx] = ARP;
+                            }
+
+                            else if (ether_type == 0x0800) {
+                                types[idx] = IPV4;
+
+                                if (length >= 34) {
+                                    uint8_t protocol = packet[23];
+                                    
+                                    if (protocol == 6) {
+										types[idx] = TCP;
+                                    }
+                                    else if (protocol == 17) {
+										types[idx] = UDP;
+                                    }
+                                    else if (protocol == 1) {
+										types[idx] = ICMP;
+                                    }
+                                }
+                            }
+                            else if (ether_type == 0x86DD) {
+								types[idx] = IPV6;
+                            }
+                        }
+                    });
+                }).wait_and_throw();
+            } catch (const sycl::exception &e) {
+                std::cerr << "SYCL exception: " << e.what() << "\n";
+				return context;
+            }
+
+			for (int i = 0; i < context.count; i++) {
+				switch (context.types[i]) {
+					case IPV4:
+						std::cout << "IPv4 packet\n";
+						break;
+					case IPV6:
+						std::cout << "IPv6 packet\n";
+						break;
+					case TCP:
+						std::cout << "TCP packet\n";
+						break;
+					case UDP:
+						std::cout << "UDP packet\n";
+						break;
+					case ICMP:
+						std::cout << "ICMP packet\n";
+						break;
+					case ARP:
+						std::cout << "ARP packet\n";
+						break;
+					default:
+						std::cout << "Unknown packet type\n";
+				}
+			}
+
+			return context;
+		}
+	} ;
+/*
+    tbb::flow::function_node<ParsedPackets, Counters> calculate_stats_node{
         g,
         tbb::flow::unlimited,
-        [&](const CaptureContext &context) -> Counters {
+        [&](const ParsedPackets &context) -> Counters {
             Counters local_counters;
 
             if (context.count == 0) {
@@ -126,7 +238,6 @@ int main(int argc, char *argv[]) {
             }
 
             try {
-
                 sycl::buffer<Packet *> packets_buf(context.burst.data(), context.count);
                 sycl::buffer<uint32_t> lengths_buf(context.packet_lengths.data(), context.count);
                 sycl::buffer<Counters> counters_buf(&local_counters, 1);
@@ -196,7 +307,7 @@ int main(int argc, char *argv[]) {
             global_counters += local_counters;
             return local_counters;
         }};
-        
+        */
     tbb::flow::function_node<CaptureContext, CaptureContext> ipv4_node {
         g,
         tbb::flow::unlimited,
@@ -217,7 +328,7 @@ int main(int argc, char *argv[]) {
 
 					h.parallel_for(sycl::range<1>(context.count), [=](sycl::id<1> idx) {
 			            Packet* pkt = acc[idx];
-                        uint8_t* data = pkt->data();  // Pointer to raw packet bytes
+                        uint8_t* data = pkt->data();
 
                         constexpr int dest_ip_offset = 30;
 
@@ -238,7 +349,7 @@ int main(int argc, char *argv[]) {
             return context;
         }};
 
-    tbb::flow::make_edge(in_node, inspect_packet_node);
+    tbb::flow::make_edge(in_node, parse_packet_node);
 
 
     in_node.activate();
