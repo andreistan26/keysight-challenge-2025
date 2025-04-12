@@ -75,8 +75,6 @@ void send_raw_packet(const char* interface, const uint8_t* data, size_t data_len
     // Send the packet
     if (sendto(sock, data, data_len, 0, (struct sockaddr*)&socket_address, sizeof(socket_address)) < 0) {
         perror("Send failed");
-    } else {
-        std::cout << "Packet sent successfully on interface " << interface << "\n";
     }
 
     close(sock);
@@ -125,14 +123,6 @@ struct CaptureContext {
 		return count;
 	}
 };
-
-void print_ip(Packet packet) {
-    for (int i = 0; i < 4; i++) {
-        std::cout << static_cast<int>(packet[30 + i]) << ".";
-    }
-    
-    std::cout << "\n";
-}
 
 uint16_t calculate_ipv4_checksum(IPv4Header *header) {
     uint16_t* data = reinterpret_cast<uint16_t*>(header);
@@ -284,6 +274,17 @@ int main(int argc, char *argv[]) {
                             }
                             else if (ether_type == 0x86DD) {
 								types[idx] |= (1 << IPV6);
+								
+								if (length >= 54) {
+                                    uint8_t protocol = packet[20]; // IPv6 Next Header field
+                                    
+                                    if (protocol == 6) {  // TCP
+                                        types[idx] |= (1 << TCP);
+                                    }
+                                    else if (protocol == 17) {  // UDP
+                                        types[idx] |= (1 << UDP);
+                                    }
+                                }
                             }
                         }
                     });
@@ -370,10 +371,6 @@ int main(int argc, char *argv[]) {
             
 			sycl::queue gpuQ(sycl::cpu_selector_v, dpc_common::exception_handler);
 			
-            for (int i = 0; i < new_context.count; i++) {
-                print_ip(*(new_context.burst[i]));
-            }
-			
 			try {
 				gpuQ.submit([&](sycl::handler &h) { 
 				    auto acc = burst_buf.get_access<sycl::access::mode::read_write>(h);
@@ -397,10 +394,6 @@ int main(int argc, char *argv[]) {
 				std::cerr << "SYCL exception: " << e.what() << "\n";
 				return {};
 			}
-			
-		    for (int i = 0; i < new_context.count; i++) {
-                print_ip(*(new_context.burst[i]));
-            }
 
             return new_context;
         }};
