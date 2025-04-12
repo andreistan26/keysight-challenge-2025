@@ -13,7 +13,7 @@
 
 #include "dpc_common.hpp"
 
-constexpr size_t burst_size = 32;
+constexpr size_t burst_size = 8;
 constexpr size_t packet_size = 1518;
 
 using Packet = std::array<uint8_t, packet_size>;
@@ -21,10 +21,10 @@ using PacketBurst = std::array<Packet, burst_size>;
 
 struct CaptureContext {
     PacketBurst burst;
-    std::vector<size_t> packet_lengths;
+    std::array<uint32_t, burst_size> packet_lengths;
     size_t count;
 
-	CaptureContext() : packet_lengths(burst_size), count(0) {}
+	CaptureContext() : count(0) {}
 
 };
 
@@ -51,23 +51,27 @@ int main(int argc, char *argv[]) {
     tbb::flow::graph g;
 
     // Input node: read bursts from pcap file
-    tbb::flow::input_node<std::shared_ptr<CaptureContext>> in_node{
+    tbb::flow::input_node<CaptureContext> in_node{
         g,
-        [&](tbb::flow_control &fc) -> std::shared_ptr<CaptureContext> {
-			auto context = std::make_shared<CaptureContext>();
+        [&](tbb::flow_control &fc) -> CaptureContext {
+			auto context = CaptureContext{};
 
-            while (context->count < burst_size) {
+            while (context.count < burst_size) {
                 struct pcap_pkthdr *header;
                 const u_char *packet;
                 int res = pcap_next_ex(handle, &header, &packet);
 				std::cout << "res = " << res << "\n";
                 if (res == 1) {
-					std::cout << "reading packet " << context->count << "\n";
-                    std::copy(packet, packet + header->caplen, context->burst[context->count].begin());
-                    context->packet_lengths[context->count] = header->caplen;
-                    context->count++;
+					std::cout << "reading packet " << context.count << "\n";
+					if (header->caplen > packet_size) {
+						std::cerr << "Packet size exceeds buffer size\n";
+						continue;
+					}
+                    std::copy(packet, packet + header->caplen, context.burst[context.count].begin());
+                    context.packet_lengths[context.count] = header->caplen;
+                    context.count++;
 				} else if (res == -2){
-					if (context->count == 0) {
+					if (context.count == 0) {
 						fc.stop();
 						return {};
 					} else {
@@ -79,23 +83,19 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-			fc.stop();
-			
             return context;
         }};
 
     // Packet inspection node
-    tbb::flow::function_node<std::shared_ptr<CaptureContext>, int> inspect_packet_node{
+    tbb::flow::function_node<CaptureContext, int> inspect_packet_node{
         g,
         tbb::flow::unlimited,
-        [&](const std::shared_ptr<CaptureContext> &context) -> int {
+        [&](const CaptureContext context) -> int {
 			sycl::queue gpuQ(sycl::gpu_selector_v, dpc_common::exception_handler);
-			std::cout << "Selected GPU Device Name: " <<
-				gpuQ.get_device().get_info<sycl::info::device::name>() << "\n";
 
 			try {
 
-				gpuQ.submit([&](sycl::handler &h) {
+				gpuQ.submit([&](sycl::handler &h) { 
 					//h.parallel_for(sycl::range<1>(context->count), [=](sycl::id<1> idx) {
 					//});
 				}).wait_and_throw();
@@ -104,14 +104,12 @@ int main(int argc, char *argv[]) {
 				return 0;
 			}
 
-            std::cout << "Processed burst of " << context->count << " packets:\n";
-            for (size_t i = 0; i < context->count; ++i) {
-                std::cout << "Packet " << i + 1 << ": Length = " << context->packet_lengths[i] << " bytes\n";
+            std::cout << "Processed burst of " << context.count << " packets:\n";
+            for (size_t i = 0; i < context.count; ++i) {
+                std::cout << "Packet " << i + 1 << ": Length = " << context.packet_lengths[i] << " bytes\n";
             }
 
-			in_node.activate();
-
-            return static_cast<int>(context->count);
+            return static_cast<int>(context.count);
         }};
 
     // Construct graph
