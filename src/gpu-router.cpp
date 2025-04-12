@@ -20,23 +20,21 @@
 
 #include "dpc_common.hpp"
 
+#define UNKNOWN 0
+#define IPV4 1
+#define IPV6 2
+#define TCP 3
+#define UDP 4
+#define ICMP 5
+#define ARP 6
+
 constexpr size_t burst_size = 8;
 constexpr size_t packet_size = 1518;
 char *output_interface_name = NULL;
 
-enum Types {
-	UNKNOWN = 0,
-	IPV4,
-	IPV6,
-	TCP,
-	UDP,
-	ICMP,
-	ARP
-};
-
 using Packet = std::array<uint8_t, packet_size>;
 using PacketBurst = std::array<Packet *, burst_size>;
-using PacketTypes = std::array<Types, burst_size>;
+using PacketTypes = std::array<uint8_t, burst_size>;
 
 void send_raw_packet(const char* interface, const uint8_t* data, size_t data_len) {
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
@@ -123,7 +121,7 @@ uint16_t calculate_ipv4_checksum(IPv4Header *header) {
     uint32_t sum = 0;
     
     // Set the checksum field to 0 before calculation
-    header.checksum = 0;
+    header->checksum = 0;
     
     // Sum all 16-bit words in the IPv4 header
     for (size_t i = 0; i < sizeof(IPv4Header) / 2; ++i) {
@@ -224,19 +222,21 @@ int main(int argc, char *argv[]) {
 			if (context.count == 0) {
 				return context;
 			}
+			
+			CaptureContext new_context = context;
 
             try {
-				sycl::queue q(sycl::gpu_selector_v, dpc_common::exception_handler);
-                sycl::buffer<Packet *> packets_buf(context.burst.data(), context.count);
-                sycl::buffer<uint32_t> lengths_buf(context.packet_lengths.data(), context.count);
-				sycl::buffer<Types> types_buf(context.types.data(), context.count);
+				sycl::queue q(sycl::cpu_selector_v, dpc_common::exception_handler);
+                sycl::buffer<Packet *> packets_buf(new_context.burst.data(), new_context.count);
+                sycl::buffer<uint32_t> lengths_buf(new_context.packet_lengths.data(), new_context.count);
+				sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
 
                 q.submit([&](sycl::handler &h) {
                     auto packets = packets_buf.get_access<sycl::access::mode::read>(h);
                     auto lengths = lengths_buf.get_access<sycl::access::mode::read>(h);
 					auto types = types_buf.get_access<sycl::access::mode::read_write>(h);
 
-                    h.parallel_for(sycl::range<1>(context.count), [=](sycl::id<1> idx) {
+                    h.parallel_for(sycl::range<1>(new_context.count), [=](sycl::id<1> idx) {
                         uint8_t *packet = packets[idx]->data();
                         uint32_t length = lengths[idx];
                         
@@ -272,11 +272,11 @@ int main(int argc, char *argv[]) {
                 }).wait_and_throw();
             } catch (const sycl::exception &e) {
                 std::cerr << "SYCL exception: " << e.what() << "\n";
-				return context;
+				return new_context;
             }
 
-			for (int i = 0; i < context.count; i++) {
-				switch (context.types[i]) {
+			for (int i = 0; i < new_context.count; i++) {
+				switch (new_context.types[i]) {
 					case IPV4:
 						std::cout << "IPv4 packet\n";
 						break;
@@ -296,18 +296,18 @@ int main(int argc, char *argv[]) {
 						std::cout << "ARP packet\n";
 						break;
 					default:
-						std::cout << "Unknown packet type\n";
+						std::cout << "Unknown packet type " << new_context.types[i] << "\n";
 				}
 			}
 
-			return context;
+			return new_context;
 		}
 	} ;
-/*
-    tbb::flow::function_node<ParsedPackets, Counters> calculate_stats_node{
+
+    tbb::flow::function_node<CaptureContext, Counters> calculate_stats_node{
         g,
         tbb::flow::unlimited,
-        [&](const ParsedPackets &context) -> Counters {
+        [&](const CaptureContext context) -> Counters {
             Counters local_counters;
 
             if (context.count == 0) {
@@ -315,76 +315,52 @@ int main(int argc, char *argv[]) {
             }
 
             try {
-                sycl::buffer<Packet *> packets_buf(context.burst.data(), context.count);
+                sycl::buffer<uint8_t> types_buf(context.types.data(), context.count);
                 sycl::buffer<uint32_t> lengths_buf(context.packet_lengths.data(), context.count);
-                sycl::buffer<Counters> counters_buf(&local_counters, 1);
+                sycl::buffer<Counters> counters_buf(&global_counters, 1);
 
                 q.submit([&](sycl::handler &h) {
-                    auto packets = packets_buf.get_access<sycl::access::mode::read>(h);
+                    auto types = types_buf.get_access<sycl::access::mode::read>(h);
                     auto lengths = lengths_buf.get_access<sycl::access::mode::read>(h);
                     auto counters = counters_buf.get_access<sycl::access::mode::atomic>(h);
 
                     h.parallel_for(sycl::range<1>(context.count), [=](sycl::id<1> idx) {
-                        uint8_t *packet = packets[idx]->data();
-                        uint32_t length = lengths[idx];
-                        
-                        if (length >= 14) {
-                            uint16_t ether_type = (packet[12] << 8) | packet[13];
-                            
-                            if (ether_type == 0x0806) {
-                                auto arp_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
-                                                   sycl::memory_scope::device>(
-                                                   counters.get_pointer()[0].arp_count);
-                                arp_counter.fetch_add(1);
-                            }
-
-                            else if (ether_type == 0x0800) {
-                                auto ipv4_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
-                                                    sycl::memory_scope::device>(
-                                                    counters.get_pointer()[0].ipv4_count);
-                                ipv4_counter.fetch_add(1);
-                                
-                                if (length >= 34) {
-                                    uint8_t protocol = packet[23];
-                                    
-                                    if (protocol == 6) {
-                                        auto tcp_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
-                                                           sycl::memory_scope::device>(
-                                                           counters.get_pointer()[0].tcp_count);
-                                        tcp_counter.fetch_add(1);
-                                    }
-                                    else if (protocol == 17) {
-                                        auto udp_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
-                                                           sycl::memory_scope::device>(
-                                                           counters.get_pointer()[0].udp_count);
-                                        udp_counter.fetch_add(1);
-                                    }
-                                    else if (protocol == 1) {
-                                        auto icmp_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
-                                                            sycl::memory_scope::device>(
-                                                            counters.get_pointer()[0].icmp_count);
-                                        icmp_counter.fetch_add(1);
-                                    }
-                                }
-                            }
-                            else if (ether_type == 0x86DD) {
-                                auto ipv6_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
-                                                    sycl::memory_scope::device>(
-                                                    counters.get_pointer()[0].ipv6_count);
-                                ipv6_counter.fetch_add(1);
-                            }
+                        if (types[idx] == IPV4) {
+                            auto ipv4_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
+                                sycl::memory_scope::device>(
+                                counters.get_pointer()[0].ipv4_count);
+                            ipv4_counter.fetch_add(1);
+                        } else if (types[idx] == IPV6) {
+                            auto ipv6_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
+                                                sycl::memory_scope::device>(
+                                                counters.get_pointer()[0].ipv6_count);
+                            ipv6_counter.fetch_add(1);            
+                        } else if (types[idx] == TCP) {
+                            auto tcp_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
+                                               sycl::memory_scope::device>(
+                                               counters.get_pointer()[0].tcp_count);
+                            tcp_counter.fetch_add(1);
+                        } else if (types[idx] == UDP) {
+                            auto udp_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
+                               sycl::memory_scope::device>(
+                               counters.get_pointer()[0].udp_count);
+                            udp_counter.fetch_add(1);
+                        } else if (types[idx] == ICMP) {
+                            auto icmp_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
+                                sycl::memory_scope::device>(
+                                counters.get_pointer()[0].icmp_count);
+                            icmp_counter.fetch_add(1);
                         }
                     });
                 }).wait_and_throw();
             } catch (const sycl::exception &e) {
                 std::cerr << "SYCL exception: " << e.what() << "\n";
-                return local_counters;
+                return global_counters;
             }
 
-            global_counters += local_counters;
-            return local_counters;
+            return global_counters;
         }};
-        */
+        
     tbb::flow::function_node<CaptureContext, CaptureContext> ipv4_node {
         g,
         tbb::flow::unlimited,
@@ -440,6 +416,7 @@ int main(int argc, char *argv[]) {
     };
 
     tbb::flow::make_edge(in_node, parse_packet_node);
+    tbb::flow::make_edge(parse_packet_node, calculate_stats_node);
 
 
     in_node.activate();
