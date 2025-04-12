@@ -11,12 +11,13 @@
 #include <tbb/flow_graph.h>
 #include <pcap.h>
 
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <arpa/inet.h>
+#include <linux/if_packet.h>
+#include <net/ethernet.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "dpc_common.hpp"
 
@@ -39,25 +40,40 @@ using PacketBurst = std::array<Packet *, burst_size>;
 using PacketTypes = std::array<uint8_t, burst_size>;
 
 void send_raw_packet(const char* interface, const uint8_t* data, size_t data_len) {
-    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+    // Create raw socket for Ethernet frames
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sock < 0) {
         perror("Socket creation failed");
         return;
     }
 
-    // Set the interface for sending the packet
+    // Get interface index
     struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
     if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
         perror("Unable to get interface index");
         close(sock);
         return;
     }
-    
-    setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, ifr.ifr_name, IFNAMSIZ);
+
+    // Bind socket to interface
+    struct sockaddr_ll socket_address;
+    memset(&socket_address, 0, sizeof(socket_address));
+    socket_address.sll_family = AF_PACKET;
+    socket_address.sll_ifindex = ifr.ifr_ifindex;
+    socket_address.sll_halen = ETH_ALEN;
+    // Copy destination MAC from Ethernet header in data
+    memcpy(socket_address.sll_addr, data, ETH_ALEN);
+
+    if (bind(sock, (struct sockaddr*)&socket_address, sizeof(socket_address)) < 0) {
+        perror("Bind failed");
+        close(sock);
+        return;
+    }
 
     // Send the packet
-    if (sendto(sock, data, data_len, 0, nullptr, 0) < 0) {
+    if (sendto(sock, data, data_len, 0, (struct sockaddr*)&socket_address, sizeof(socket_address)) < 0) {
         perror("Send failed");
     } else {
         std::cout << "Packet sent successfully on interface " << interface << "\n";
@@ -346,28 +362,34 @@ int main(int argc, char *argv[]) {
         g,
         tbb::flow::unlimited,
         [&](const CaptureContext context) -> CaptureContext {
-            sycl::buffer<Packet *> burst_buf(context.burst.data(), context.count);
-            sycl::buffer<uint32_t> len_buf(context.packet_lengths.data(), context.count);
+            CaptureContext new_context = context;
+            
+            sycl::buffer<Packet *> burst_buf(new_context.burst.data(), new_context.count);
+            sycl::buffer<uint32_t> len_buf(new_context.packet_lengths.data(), new_context.count);
+            sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
             
 			sycl::queue gpuQ(sycl::cpu_selector_v, dpc_common::exception_handler);
 			
-            for (int i = 0; i < context.count; i++) {
-                print_ip(*(context.burst[i]));
+            for (int i = 0; i < new_context.count; i++) {
+                print_ip(*(new_context.burst[i]));
             }
 			
 			try {
 				gpuQ.submit([&](sycl::handler &h) { 
 				    auto acc = burst_buf.get_access<sycl::access::mode::read_write>(h);
                     auto len_acc = len_buf.get_access<sycl::access::mode::read_write>(h);
+                    auto types_acc = types_buf.get_access<sycl::access::mode::read_write>(h);
 
-					h.parallel_for(sycl::range<1>(context.count), [=](sycl::id<1> idx) {
-			            Packet* pkt = acc[idx];
-                        uint8_t* data = pkt->data();
+					h.parallel_for(sycl::range<1>(new_context.count), [=](sycl::id<1> idx) {
+					    if (types_acc[idx] == IPV4 || types_acc[idx] == TCP || types_acc[idx] == UDP || types_acc[idx] == ICMP) {
+			                Packet* pkt = acc[idx];
+                            uint8_t* data = pkt->data();
 
-                        constexpr int dest_ip_offset = 30;
+                            constexpr int dest_ip_offset = 30;
 
-                        for (int j = 0; j < 4; ++j) {
-                            data[dest_ip_offset + j] += 1;
+                            for (int j = 0; j < 4; ++j) {
+                                data[dest_ip_offset + j] += 1;
+                            }
                         }
 					});
 				}).wait_and_throw();
@@ -376,20 +398,22 @@ int main(int argc, char *argv[]) {
 				return {};
 			}
 			
-		    for (int i = 0; i < context.count; i++) {
-                print_ip(*(context.burst[i]));
+		    for (int i = 0; i < new_context.count; i++) {
+                print_ip(*(new_context.burst[i]));
             }
 
-            return context;
+            return new_context;
         }};
         
         
     tbb::flow::function_node<CaptureContext, int> send_node {
         g,
         tbb::flow::unlimited,
-        [&](const CaptureContext context) -> int {
+        [&](const CaptureContext &context) -> int {
             for (int i = 0; i < context.count; i++) {
-                send_raw_packet(output_interface_name, context.burst[i]->data(), context.packet_lengths[i]);
+                if (context.types[i] == IPV4 || context.types[i] == TCP || context.types[i] == UDP || context.types[i] == ICMP) {
+                    send_raw_packet(output_interface_name, context.burst[i]->data(), context.packet_lengths[i]);
+                }
             }
             
             return 0;
@@ -398,7 +422,8 @@ int main(int argc, char *argv[]) {
 
     tbb::flow::make_edge(in_node, parse_packet_node);
     tbb::flow::make_edge(parse_packet_node, calculate_stats_node);
-
+    tbb::flow::make_edge(parse_packet_node, ipv4_node);
+    tbb::flow::make_edge(ipv4_node, send_node);
 
     in_node.activate();
     g.wait_for_all();
