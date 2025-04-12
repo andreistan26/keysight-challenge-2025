@@ -31,6 +31,14 @@ struct CaptureContext {
     }
 };
 
+void print_ip(Packet packet) {
+    for (int i = 0; i < 4; i++) {
+        std::cout << static_cast<int>(packet[30 + i]) << ".";
+    }
+    
+    std::cout << "\n";
+}
+
 struct Counters {
     uint32_t ipv4_count = 0;
     uint32_t ipv6_count = 0;
@@ -58,7 +66,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    sycl::queue q(sycl::gpu_selector_v, dpc_common::exception_handler);
+    sycl::queue q(sycl::cpu_selector_v, dpc_common::exception_handler);
     std::cout << "Using device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";
 
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -118,12 +126,8 @@ int main(int argc, char *argv[]) {
             }
 
             try {
-                std::vector<std::array<uint8_t, packet_size>> host_packets(context.count);
-                for (size_t i = 0; i < context.count; i++) {
-                    host_packets[i] = *context.burst[i];
-                }
 
-                sycl::buffer<std::array<uint8_t, packet_size>> packets_buf(host_packets.data(), context.count);
+                sycl::buffer<Packet *> packets_buf(context.burst.data(), context.count);
                 sycl::buffer<uint32_t> lengths_buf(context.packet_lengths.data(), context.count);
                 sycl::buffer<Counters> counters_buf(&local_counters, 1);
 
@@ -133,7 +137,7 @@ int main(int argc, char *argv[]) {
                     auto counters = counters_buf.get_access<sycl::access::mode::atomic>(h);
 
                     h.parallel_for(sycl::range<1>(context.count), [=](sycl::id<1> idx) {
-                        const auto& packet = packets[idx];
+                        uint8_t *packet = packets[idx]->data();
                         uint32_t length = lengths[idx];
                         
                         if (length >= 14) {
@@ -191,6 +195,47 @@ int main(int argc, char *argv[]) {
 
             global_counters += local_counters;
             return local_counters;
+        }};
+        
+    tbb::flow::function_node<CaptureContext, CaptureContext> ipv4_node {
+        g,
+        tbb::flow::unlimited,
+        [&](const CaptureContext context) -> CaptureContext {
+            sycl::buffer<Packet *> burst_buf(context.burst.data(), context.count);
+            sycl::buffer<uint32_t> len_buf(context.packet_lengths.data(), context.count);
+            
+			sycl::queue gpuQ(sycl::cpu_selector_v, dpc_common::exception_handler);
+			
+            for (int i = 0; i < context.count; i++) {
+                print_ip(*(context.burst[i]));
+            }
+			
+			try {
+				gpuQ.submit([&](sycl::handler &h) { 
+				    auto acc = burst_buf.get_access<sycl::access::mode::read_write>(h);
+                    auto len_acc = len_buf.get_access<sycl::access::mode::read_write>(h);
+
+					h.parallel_for(sycl::range<1>(context.count), [=](sycl::id<1> idx) {
+			            Packet* pkt = acc[idx];
+                        uint8_t* data = pkt->data();  // Pointer to raw packet bytes
+
+                        constexpr int dest_ip_offset = 30;
+
+                        for (int j = 0; j < 4; ++j) {
+                            data[dest_ip_offset + j] += 1;
+                        }
+					});
+				}).wait_and_throw();
+			} catch (const sycl::exception &e) {
+				std::cerr << "SYCL exception: " << e.what() << "\n";
+				return {};
+			}
+			
+		    for (int i = 0; i < context.count; i++) {
+                print_ip(*(context.burst[i]));
+            }
+
+            return context;
         }};
 
     tbb::flow::make_edge(in_node, inspect_packet_node);
