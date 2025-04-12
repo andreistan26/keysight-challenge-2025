@@ -34,10 +34,111 @@
 constexpr size_t burst_size = 8;
 constexpr size_t packet_size = 1518;
 char *output_interface_name = NULL;
+char *input_interface_name = NULL;
 
 using Packet = std::array<uint8_t, packet_size>;
 using PacketBurst = std::array<Packet *, burst_size>;
 using PacketTypes = std::array<uint8_t, burst_size>;
+
+bool receive_one_packet(const char* interface_name, Packet *out_packet, uint32_t& packet_length) {
+    int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sockfd < 0) {
+        perror("socket");
+        return false;
+    }
+
+    // Get interface index
+    struct ifreq ifr;
+    std::strncpy(ifr.ifr_name, interface_name, IFNAMSIZ);
+    if (ioctl(sockfd, SIOCGIFINDEX, &ifr) < 0) {
+        perror("SIOCGIFINDEX");
+        close(sockfd);
+        return false;
+    }
+
+    // Bind socket to interface
+    struct sockaddr_ll saddr = {};
+    saddr.sll_family   = AF_PACKET;
+    saddr.sll_protocol = htons(ETH_P_ALL);
+    saddr.sll_ifindex  = ifr.ifr_ifindex;
+
+    if (bind(sockfd, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
+        perror("bind");
+        close(sockfd);
+        return false;
+    }
+
+    // Receive a single packet
+    uint8_t buffer[packet_size];
+    ssize_t len = recv(sockfd, buffer, sizeof(buffer), 0);
+    if (len < 0) {
+        perror("recv");
+        close(sockfd);
+        return false;
+    }
+
+    // Copy into Packet
+    std::copy(buffer, buffer + len, out_packet->begin());
+    packet_length = len;
+
+    close(sockfd);
+    return true;
+}
+
+uint16_t calculate_checksum(const uint8_t* data, size_t length) {
+    uint32_t sum = 0;
+
+    // Sum every 16-bit word
+    for (size_t i = 0; i < length; i += 2) {
+        uint16_t word = data[i] << 8;
+        if (i + 1 < length) {
+            word |= data[i + 1];
+        }
+        sum += word;
+    }
+
+    // Fold overflow
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    return static_cast<uint16_t>(~sum);
+}
+
+void recalculate_ipv4_checksum(Packet* packet) {
+    constexpr size_t ethernet_header_length = 14;
+    constexpr size_t ipv4_header_offset = ethernet_header_length;
+
+    // Extract the IPv4 header length (IHL) from the packet (in 32-bit words)
+    uint8_t ihl = (*packet)[ipv4_header_offset] & 0x0F;
+    size_t ipv4_header_length = ihl * 4;
+
+    // Zero out the checksum field before recalculating
+    size_t checksum_offset = ipv4_header_offset + 10;
+    (*packet)[checksum_offset] = 0;
+    (*packet)[checksum_offset + 1] = 0;
+
+    // Calculate the checksum
+    uint16_t checksum = calculate_checksum(packet->data() + ipv4_header_offset, ipv4_header_length);
+
+    // Write checksum back into the header (big-endian / network byte order)
+    (*packet)[checksum_offset] = checksum >> 8;
+    (*packet)[checksum_offset + 1] = checksum & 0xFF;
+}
+
+void decrement_ttl(Packet *packet) {
+    constexpr size_t ethernet_header_length = 14;
+    constexpr size_t ipv4_header_offset = ethernet_header_length;
+    constexpr size_t ttl_offset = ipv4_header_offset + 8;
+
+    // Decrement TTL (don't let it wrap below 0)
+    if ((*packet)[ttl_offset] > 0) {
+        --(*packet)[ttl_offset];
+    }
+
+    // Recalculate checksum after modifying TTL
+    recalculate_ipv4_checksum(packet);
+}
 
 void send_raw_packet(const char* interface, const uint8_t* data, size_t data_len) {
     // Create raw socket for Ethernet frames
@@ -167,14 +268,18 @@ struct Counters {
 };
 
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <pcap_file> <output_interface_name>\n";
+    if (argc != 3 && argc != 4) {
+        std::cerr << "Usage: " << argv[0] << " <pcap_file> <output_interface_name> [input_interface_name]\n";
         return 1;
     }
     
     output_interface_name = argv[2];
+    
+    if (argc == 4) {
+        input_interface_name = argv[3];
+    }
 
-    sycl::queue q(sycl::gpu_selector_v, dpc_common::exception_handler);
+    sycl::queue q(sycl::cpu_selector_v, dpc_common::exception_handler);
     std::cout << "Using device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";
 
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -197,26 +302,38 @@ int main(int argc, char *argv[]) {
             while (context.count < burst_size) {
                 struct pcap_pkthdr *header;
                 const u_char *packet;
-                int res = pcap_next_ex(handle, &header, &packet);
-                if (res == 1) {
-                    if (header->caplen > packet_size) {
-                        std::cerr << "Packet size exceeds buffer size\n";
-                        continue;
-                    }
-                    std::copy(packet, packet + header->caplen, context.burst[context.count]->begin());
-                    context.packet_lengths[context.count] = header->caplen;
-                    context.count++;
-                } else if (res == -2) {
-                    if (context.count == 0) {
+                bool ok = false;
+                
+                if (input_interface_name == NULL) {
+                    int res = pcap_next_ex(handle, &header, &packet);
+                    if (res == 1) {
+                        if (header->caplen > packet_size) {
+                            std::cerr << "Packet size exceeds buffer size\n";
+                            continue;
+                        }
+                        std::copy(packet, packet + header->caplen, context.burst[context.count]->begin());
+                        context.packet_lengths[context.count] = header->caplen;
+                        context.count++;
+                    } else if (res == -2) {
+                        if (context.count == 0) {
+                            fc.stop();
+                            return {};
+                        } else {
+                            break;
+                        }
+                    } else if (res < 0) {
+                        std::cerr << "Error reading packet: " << pcap_geterr(handle) << "\n";
                         fc.stop();
                         return {};
-                    } else {
-                        break;
                     }
-                } else if (res < 0) {
-                    std::cerr << "Error reading packet: " << pcap_geterr(handle) << "\n";
-                    fc.stop();
-                    return {};
+                } else {
+                    bool status = receive_one_packet(input_interface_name, context.burst[context.count], context.packet_lengths[context.count]);
+                    
+                    if (status) {
+                        context.count++;
+                    } else {
+                        fc.stop();
+                    }
                 }
             }
 
@@ -234,7 +351,7 @@ int main(int argc, char *argv[]) {
 			CaptureContext new_context = context;
 
             try {
-				sycl::queue q(sycl::gpu_selector_v, dpc_common::exception_handler);
+				sycl::queue q(sycl::cpu_selector_v, dpc_common::exception_handler);
                 sycl::buffer<Packet *> packets_buf(new_context.burst.data(), new_context.count);
                 sycl::buffer<uint32_t> lengths_buf(new_context.packet_lengths.data(), new_context.count);
 				sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
@@ -369,7 +486,7 @@ int main(int argc, char *argv[]) {
             sycl::buffer<uint32_t> len_buf(new_context.packet_lengths.data(), new_context.count);
             sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
             
-			sycl::queue gpuQ(sycl::gpu_selector_v, dpc_common::exception_handler);
+			sycl::queue gpuQ(sycl::cpu_selector_v, dpc_common::exception_handler);
 			
 			try {
 				gpuQ.submit([&](sycl::handler &h) { 
@@ -387,6 +504,9 @@ int main(int argc, char *argv[]) {
                             for (int j = 0; j < 4; ++j) {
                                 data[dest_ip_offset + j] += 1;
                             }
+                            
+                            recalculate_ipv4_checksum(pkt);
+                            decrement_ttl(pkt);
                         }
 					});
 				}).wait_and_throw();
@@ -422,7 +542,7 @@ int main(int argc, char *argv[]) {
             sycl::buffer<uint32_t> len_buf(new_context.packet_lengths.data(), new_context.count);
             sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
             
-			sycl::queue gpuQ(sycl::gpu_selector_v, dpc_common::exception_handler);
+			sycl::queue gpuQ(sycl::cpu_selector_v, dpc_common::exception_handler);
 			
 			try {
 				gpuQ.submit([&](sycl::handler &h) { 
