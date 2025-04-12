@@ -4,6 +4,7 @@
 #include <string>
 #include <stdexcept>
 #include <memory>
+#include <chrono>
 
 #include <sycl/sycl.hpp>
 #include <tbb/blocked_range.h>
@@ -22,8 +23,6 @@
 #include "dpc_common.hpp"
 
 #define IS_TYPE(x, y) ((x) & (1 << (y)))
-
-#define TIME_PROF 1
 
 #define UNKNOWN 0
 #define IPV4 1
@@ -143,14 +142,12 @@ void decrement_ttl(Packet *packet) {
 }
 
 void send_raw_packet(const char* interface, const uint8_t* data, size_t data_len) {
-    // Create raw socket for Ethernet frames
     int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sock < 0) {
         perror("Socket creation failed");
         return;
     }
 
-    // Get interface index
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
@@ -160,13 +157,11 @@ void send_raw_packet(const char* interface, const uint8_t* data, size_t data_len
         return;
     }
 
-    // Bind socket to interface
     struct sockaddr_ll socket_address;
     memset(&socket_address, 0, sizeof(socket_address));
     socket_address.sll_family = AF_PACKET;
     socket_address.sll_ifindex = ifr.ifr_ifindex;
     socket_address.sll_halen = ETH_ALEN;
-    // Copy destination MAC from Ethernet header in data
     memcpy(socket_address.sll_addr, data, ETH_ALEN);
 
     if (bind(sock, (struct sockaddr*)&socket_address, sizeof(socket_address)) < 0) {
@@ -175,7 +170,6 @@ void send_raw_packet(const char* interface, const uint8_t* data, size_t data_len
         return;
     }
 
-    // Send the packet
     if (sendto(sock, data, data_len, 0, (struct sockaddr*)&socket_address, sizeof(socket_address)) < 0) {
         perror("Send failed");
     }
@@ -195,7 +189,6 @@ struct IPv4Header {
     uint32_t source_ip;       // Source IP address (32 bits)
     uint32_t dest_ip;         // Destination IP address (32 bits)
 
-    // Simplified function to return pointer to the raw header data
     uint8_t* data() {
         return reinterpret_cast<uint8_t*>(this);
     }
@@ -234,20 +227,16 @@ uint16_t calculate_ipv4_checksum(IPv4Header *header) {
     uint16_t* data = reinterpret_cast<uint16_t*>(header);
     uint32_t sum = 0;
     
-    // Set the checksum field to 0 before calculation
     header->checksum = 0;
     
-    // Sum all 16-bit words in the IPv4 header
     for (size_t i = 0; i < sizeof(IPv4Header) / 2; ++i) {
         sum += data[i];
         
-        // Carry around the overflow (16-bit sum wraparound)
         if (sum > 0xFFFF) {
             sum -= 0xFFFF;
         }
     }
 
-    // Take one's complement of the sum
     return static_cast<uint16_t>(~sum);
 }
 
@@ -284,9 +273,6 @@ int main(int argc, char *argv[]) {
         input_interface_name = argv[3];
     }
 
-    sycl::queue q(sycl::gpu_selector_v, dpc_common::exception_handler);
-    std::cout << "Using device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";
-
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_t *handle = pcap_open_offline(argv[1], errbuf);
     if (!handle) {
@@ -318,6 +304,10 @@ int main(int argc, char *argv[]) {
                         }
                         std::copy(packet, packet + header->caplen, context.burst[context.count]->begin());
                         context.packet_lengths[context.count] = header->caplen;
+#ifdef TIME_PROF
+					context.timestamps[context.count] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+						std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+#endif
                         context.count++;
                     } else if (res == -2) {
                         if (context.count == 0) {
@@ -356,7 +346,7 @@ int main(int argc, char *argv[]) {
 			CaptureContext new_context = context;
 
             try {
-				sycl::queue q(sycl::gpu_selector_v, dpc_common::exception_handler);
+				sycl::queue q(sycl::cpu_selector_v, dpc_common::exception_handler);
                 sycl::buffer<Packet *> packets_buf(new_context.burst.data(), new_context.count);
                 sycl::buffer<uint32_t> lengths_buf(new_context.packet_lengths.data(), new_context.count);
 				sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
@@ -398,12 +388,12 @@ int main(int argc, char *argv[]) {
 								types[idx] |= (1 << IPV6);
 								
 								if (length >= 54) {
-                                    uint8_t protocol = packet[20]; // IPv6 Next Header field
+                                    uint8_t protocol = packet[20];
                                     
-                                    if (protocol == 6) {  // TCP
+                                    if (protocol == 6) {
                                         types[idx] |= (1 << TCP);
                                     }
-                                    else if (protocol == 17) {  // UDP
+                                    else if (protocol == 17) {
                                         types[idx] |= (1 << UDP);
                                     }
                                 }
@@ -431,6 +421,7 @@ int main(int argc, char *argv[]) {
             }
 
             try {
+				sycl::queue q(sycl::cpu_selector_v, dpc_common::exception_handler);
                 sycl::buffer<uint8_t> types_buf(context.types.data(), context.count);
                 sycl::buffer<uint32_t> lengths_buf(context.packet_lengths.data(), context.count);
                 sycl::buffer<Counters> counters_buf(&global_counters, 1);
@@ -480,7 +471,7 @@ int main(int argc, char *argv[]) {
 
             return global_counters;
         }};
-        
+
     tbb::flow::function_node<CaptureContext, CaptureContext> ipv4_node {
         g,
         tbb::flow::unlimited,
@@ -491,7 +482,7 @@ int main(int argc, char *argv[]) {
             sycl::buffer<uint32_t> len_buf(new_context.packet_lengths.data(), new_context.count);
             sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
             
-			sycl::queue gpuQ(sycl::gpu_selector_v, dpc_common::exception_handler);
+			sycl::queue gpuQ(sycl::cpu_selector_v, dpc_common::exception_handler);
 			
 			try {
 				gpuQ.submit([&](sycl::handler &h) { 
@@ -529,6 +520,13 @@ int main(int argc, char *argv[]) {
         [&](const CaptureContext &context) -> int {
             for (int i = 0; i < context.count; i++) {
                 if (IS_TYPE(context.types[i], IPV4)) {
+#ifdef TIME_PROF
+					uint64_t timestamp = context.timestamps[i];
+					uint64_t time_diff = std::chrono::duration_cast<std::chrono::nanoseconds>(
+						std::chrono::high_resolution_clock::now().time_since_epoch()).count() - timestamp;
+					std::cout << "Time difference: " << time_diff << " ns\n";
+#endif
+
                     send_raw_packet(output_interface_name, context.burst[i]->data(), context.packet_lengths[i]);
                 }
             }
