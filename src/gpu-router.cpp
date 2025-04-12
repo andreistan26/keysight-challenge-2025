@@ -11,10 +11,18 @@
 #include <tbb/flow_graph.h>
 #include <pcap.h>
 
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+
 #include "dpc_common.hpp"
 
 constexpr size_t burst_size = 8;
 constexpr size_t packet_size = 1518;
+char *output_interface_name = NULL;
 
 enum Types {
 	UNKNOWN = 0,
@@ -29,6 +37,52 @@ enum Types {
 using Packet = std::array<uint8_t, packet_size>;
 using PacketBurst = std::array<Packet *, burst_size>;
 using PacketTypes = std::array<Types, burst_size>;
+
+void send_raw_packet(const char* interface, const uint8_t* data, size_t data_len) {
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+    if (sock < 0) {
+        perror("Socket creation failed");
+        return;
+    }
+
+    // Set the interface for sending the packet
+    struct ifreq ifr;
+    strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
+    if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
+        perror("Unable to get interface index");
+        close(sock);
+        return;
+    }
+    
+    setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, ifr.ifr_name, IFNAMSIZ);
+
+    // Send the packet
+    if (sendto(sock, data, data_len, 0, nullptr, 0) < 0) {
+        perror("Send failed");
+    } else {
+        std::cout << "Packet sent successfully on interface " << interface << "\n";
+    }
+
+    close(sock);
+}
+
+struct IPv4Header {
+    uint8_t  version_ihl;     // Versioncal (4 bits) + IHL (4 bits)
+    uint8_t  tos;             // Type of Service
+    uint16_t total_length;    // Total length (16 bits)
+    uint16_t identification;  // Identification (16 bits)
+    uint16_t flags_offset;    // Flags (3 bits) + Fragment offset (13 bits)
+    uint8_t  ttl;             // Time to live
+    uint8_t  protocol;        // Protocol (e.g., TCP = 6, UDP = 17)
+    uint16_t checksum;        // Checksum (16 bits)
+    uint32_t source_ip;       // Source IP address (32 bits)
+    uint32_t dest_ip;         // Destination IP address (32 bits)
+
+    // Simplified function to return pointer to the raw header data
+    uint8_t* data() {
+        return reinterpret_cast<uint8_t*>(this);
+    }
+};
 
 struct CaptureContext {
 	PacketTypes types;
@@ -64,6 +118,27 @@ void print_ip(Packet packet) {
     std::cout << "\n";
 }
 
+uint16_t calculate_ipv4_checksum(IPv4Header *header) {
+    uint16_t* data = reinterpret_cast<uint16_t*>(header);
+    uint32_t sum = 0;
+    
+    // Set the checksum field to 0 before calculation
+    header.checksum = 0;
+    
+    // Sum all 16-bit words in the IPv4 header
+    for (size_t i = 0; i < sizeof(IPv4Header) / 2; ++i) {
+        sum += data[i];
+        
+        // Carry around the overflow (16-bit sum wraparound)
+        if (sum > 0xFFFF) {
+            sum -= 0xFFFF;
+        }
+    }
+
+    // Take one's complement of the sum
+    return static_cast<uint16_t>(~sum);
+}
+
 struct Counters {
     uint32_t ipv4_count = 0;
     uint32_t ipv6_count = 0;
@@ -86,10 +161,12 @@ struct Counters {
 };
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        std::cerr << "Usage: " << argv[0] << " <pcap_file>\n";
+    if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " <pcap_file> <output_interface_name>\n";
         return 1;
     }
+    
+    output_interface_name = argv[2];
 
     sycl::queue q(sycl::cpu_selector_v, dpc_common::exception_handler);
     std::cout << "Using device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";
@@ -348,6 +425,19 @@ int main(int argc, char *argv[]) {
 
             return context;
         }};
+        
+        
+    tbb::flow::function_node<CaptureContext, int> send_node {
+        g,
+        tbb::flow::unlimited,
+        [&](const CaptureContext context) -> int {
+            for (int i = 0; i < context.count; i++) {
+                send_raw_packet(output_interface_name, context.burst[i]->data(), context.packet_lengths[i]);
+            }
+            
+            return 0;
+        }
+    };
 
     tbb::flow::make_edge(in_node, parse_packet_node);
 
