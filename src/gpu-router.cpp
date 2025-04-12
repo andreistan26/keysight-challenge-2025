@@ -174,7 +174,7 @@ int main(int argc, char *argv[]) {
     
     output_interface_name = argv[2];
 
-    sycl::queue q(sycl::cpu_selector_v, dpc_common::exception_handler);
+    sycl::queue q(sycl::gpu_selector_v, dpc_common::exception_handler);
     std::cout << "Using device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";
 
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -234,7 +234,7 @@ int main(int argc, char *argv[]) {
 			CaptureContext new_context = context;
 
             try {
-				sycl::queue q(sycl::cpu_selector_v, dpc_common::exception_handler);
+				sycl::queue q(sycl::gpu_selector_v, dpc_common::exception_handler);
                 sycl::buffer<Packet *> packets_buf(new_context.burst.data(), new_context.count);
                 sycl::buffer<uint32_t> lengths_buf(new_context.packet_lengths.data(), new_context.count);
 				sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
@@ -369,7 +369,7 @@ int main(int argc, char *argv[]) {
             sycl::buffer<uint32_t> len_buf(new_context.packet_lengths.data(), new_context.count);
             sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
             
-			sycl::queue gpuQ(sycl::cpu_selector_v, dpc_common::exception_handler);
+			sycl::queue gpuQ(sycl::gpu_selector_v, dpc_common::exception_handler);
 			
 			try {
 				gpuQ.submit([&](sycl::handler &h) { 
@@ -397,8 +397,7 @@ int main(int argc, char *argv[]) {
 
             return new_context;
         }};
-        
-        
+                
     tbb::flow::function_node<CaptureContext, int> send_node {
         g,
         tbb::flow::unlimited,
@@ -412,10 +411,43 @@ int main(int argc, char *argv[]) {
             return 0;
         }
     };
+    
+    tbb::flow::function_node<CaptureContext, CaptureContext> ipv6_node {
+        g,
+        tbb::flow::unlimited,
+        [&](const CaptureContext context) -> CaptureContext {
+            CaptureContext new_context = context;
+            
+            sycl::buffer<Packet *> burst_buf(new_context.burst.data(), new_context.count);
+            sycl::buffer<uint32_t> len_buf(new_context.packet_lengths.data(), new_context.count);
+            sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
+            
+			sycl::queue gpuQ(sycl::gpu_selector_v, dpc_common::exception_handler);
+			
+			try {
+				gpuQ.submit([&](sycl::handler &h) { 
+				    auto acc = burst_buf.get_access<sycl::access::mode::read_write>(h);
+                    auto len_acc = len_buf.get_access<sycl::access::mode::read_write>(h);
+                    auto types_acc = types_buf.get_access<sycl::access::mode::read_write>(h);
+
+					h.parallel_for(sycl::range<1>(new_context.count), [=](sycl::id<1> idx) {
+					    if (IS_TYPE(types_acc[idx], IPV6)) {
+			                // ROUTE IPv6 PACKET
+                        }
+					});
+				}).wait_and_throw();
+			} catch (const sycl::exception &e) {
+				std::cerr << "SYCL exception: " << e.what() << "\n";
+				return {};
+			}
+
+            return new_context;
+        }};
 
     tbb::flow::make_edge(in_node, parse_packet_node);
     tbb::flow::make_edge(parse_packet_node, calculate_stats_node);
     tbb::flow::make_edge(parse_packet_node, ipv4_node);
+    tbb::flow::make_edge(parse_packet_node, ipv6_node);
     tbb::flow::make_edge(ipv4_node, send_node);
 
     in_node.activate();
