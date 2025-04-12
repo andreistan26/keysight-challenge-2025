@@ -23,6 +23,8 @@
 
 #define IS_TYPE(x, y) ((x) & (1 << (y)))
 
+#define TIME_PROF 1
+
 #define UNKNOWN 0
 #define IPV4 1
 #define IPV6 2
@@ -205,6 +207,9 @@ struct CaptureContext {
     std::array<uint32_t, burst_size> packet_lengths;
     size_t count;
 
+#ifdef TIME_PROF
+	std::array<uint64_t, burst_size> timestamps;
+#endif
 
     CaptureContext() : count(0) {
 		std::fill(types.begin(), types.end(), UNKNOWN);
@@ -279,7 +284,7 @@ int main(int argc, char *argv[]) {
         input_interface_name = argv[3];
     }
 
-    sycl::queue q(sycl::cpu_selector_v, dpc_common::exception_handler);
+    sycl::queue q(sycl::gpu_selector_v, dpc_common::exception_handler);
     std::cout << "Using device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";
 
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -351,7 +356,7 @@ int main(int argc, char *argv[]) {
 			CaptureContext new_context = context;
 
             try {
-				sycl::queue q(sycl::cpu_selector_v, dpc_common::exception_handler);
+				sycl::queue q(sycl::gpu_selector_v, dpc_common::exception_handler);
                 sycl::buffer<Packet *> packets_buf(new_context.burst.data(), new_context.count);
                 sycl::buffer<uint32_t> lengths_buf(new_context.packet_lengths.data(), new_context.count);
 				sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
@@ -486,7 +491,7 @@ int main(int argc, char *argv[]) {
             sycl::buffer<uint32_t> len_buf(new_context.packet_lengths.data(), new_context.count);
             sycl::buffer<uint8_t> types_buf(new_context.types.data(), new_context.count);
             
-			sycl::queue gpuQ(sycl::cpu_selector_v, dpc_common::exception_handler);
+			sycl::queue gpuQ(sycl::gpu_selector_v, dpc_common::exception_handler);
 			
 			try {
 				gpuQ.submit([&](sycl::handler &h) { 
