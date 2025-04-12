@@ -20,6 +20,8 @@
 
 #include "dpc_common.hpp"
 
+#define IS_TYPE(x, y) ((x) & (1 << (y)))
+
 #define UNKNOWN 0
 #define IPV4 1
 #define IPV6 2
@@ -244,28 +246,28 @@ int main(int argc, char *argv[]) {
                             uint16_t ether_type = (packet[12] << 8) | packet[13];
                             
                             if (ether_type == 0x0806) {
-								types[idx] = ARP;
+								types[idx] |= (1 << ARP);
                             }
 
                             else if (ether_type == 0x0800) {
-                                types[idx] = IPV4;
+                                types[idx] |= (1 << IPV4);
 
                                 if (length >= 34) {
                                     uint8_t protocol = packet[23];
                                     
                                     if (protocol == 6) {
-										types[idx] = TCP;
+										types[idx] |= (1 << TCP);
                                     }
                                     else if (protocol == 17) {
-										types[idx] = UDP;
+										types[idx] |= (1 << UDP);
                                     }
                                     else if (protocol == 1) {
-										types[idx] = ICMP;
+										types[idx] |= (1 << ICMP);
                                     }
                                 }
                             }
                             else if (ether_type == 0x86DD) {
-								types[idx] = IPV6;
+								types[idx] |= (1 << IPV6);
                             }
                         }
                     });
@@ -274,31 +276,6 @@ int main(int argc, char *argv[]) {
                 std::cerr << "SYCL exception: " << e.what() << "\n";
 				return new_context;
             }
-
-			for (int i = 0; i < new_context.count; i++) {
-				switch (new_context.types[i]) {
-					case IPV4:
-						std::cout << "IPv4 packet\n";
-						break;
-					case IPV6:
-						std::cout << "IPv6 packet\n";
-						break;
-					case TCP:
-						std::cout << "TCP packet\n";
-						break;
-					case UDP:
-						std::cout << "UDP packet\n";
-						break;
-					case ICMP:
-						std::cout << "ICMP packet\n";
-						break;
-					case ARP:
-						std::cout << "ARP packet\n";
-						break;
-					default:
-						std::cout << "Unknown packet type " << new_context.types[i] << "\n";
-				}
-			}
 
 			return new_context;
 		}
@@ -325,27 +302,31 @@ int main(int argc, char *argv[]) {
                     auto counters = counters_buf.get_access<sycl::access::mode::atomic>(h);
 
                     h.parallel_for(sycl::range<1>(context.count), [=](sycl::id<1> idx) {
-                        if (types[idx] == IPV4) {
+                        if (IS_TYPE(types[idx], IPV4)) {
                             auto ipv4_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
                                 sycl::memory_scope::device>(
                                 counters.get_pointer()[0].ipv4_count);
                             ipv4_counter.fetch_add(1);
-                        } else if (types[idx] == IPV6) {
+                        }
+						if (IS_TYPE(types[idx], IPV6)) {
                             auto ipv6_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
                                                 sycl::memory_scope::device>(
                                                 counters.get_pointer()[0].ipv6_count);
                             ipv6_counter.fetch_add(1);            
-                        } else if (types[idx] == TCP) {
+                        }
+						if (IS_TYPE(types[idx], TCP)) {
                             auto tcp_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
                                                sycl::memory_scope::device>(
                                                counters.get_pointer()[0].tcp_count);
                             tcp_counter.fetch_add(1);
-                        } else if (types[idx] == UDP) {
+                        }
+						if (IS_TYPE(types[idx], UDP)) {
                             auto udp_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
                                sycl::memory_scope::device>(
                                counters.get_pointer()[0].udp_count);
                             udp_counter.fetch_add(1);
-                        } else if (types[idx] == ICMP) {
+                        }
+						if (IS_TYPE(types[idx], ICMP)) {
                             auto icmp_counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, 
                                 sycl::memory_scope::device>(
                                 counters.get_pointer()[0].icmp_count);
