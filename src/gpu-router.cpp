@@ -381,7 +381,7 @@ int main(int argc, char *argv[]) {
                     auto types_acc = types_buf.get_access<sycl::access::mode::read_write>(h);
 
 					h.parallel_for(sycl::range<1>(new_context.count), [=](sycl::id<1> idx) {
-					    if (types_acc[idx] == IPV4 || types_acc[idx] == TCP || types_acc[idx] == UDP || types_acc[idx] == ICMP) {
+					    if (IS_TYPE(types_acc[idx], IPV4)) {
 			                Packet* pkt = acc[idx];
                             uint8_t* data = pkt->data();
 
@@ -411,7 +411,7 @@ int main(int argc, char *argv[]) {
         tbb::flow::unlimited,
         [&](const CaptureContext &context) -> int {
             for (int i = 0; i < context.count; i++) {
-                if (context.types[i] == IPV4 || context.types[i] == TCP || context.types[i] == UDP || context.types[i] == ICMP) {
+                if (IS_TYPE(context.types[i], IPV4)) {
                     send_raw_packet(output_interface_name, context.burst[i]->data(), context.packet_lengths[i]);
                 }
             }
