@@ -263,14 +263,14 @@ struct Counters {
 
 int main(int argc, char *argv[]) {
     if (argc != 3 && argc != 4) {
-        std::cerr << "Usage: " << argv[0] << " <pcap_file> <output_interface_name> [input_interface_name]\n";
+        std::cerr << "Usage: " << argv[0] << " <pcap_file> <output_interface_name> [is_input_interface]\n";
         return 1;
     }
     
     output_interface_name = argv[2];
     
     if (argc == 4) {
-        input_interface_name = argv[3];
+        input_interface_name = argv[2];
     }
 
     char errbuf[PCAP_ERRBUF_SIZE];
