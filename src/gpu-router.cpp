@@ -60,6 +60,7 @@ int main(int argc, char *argv[]) {
                 struct pcap_pkthdr *header;
                 const u_char *packet;
                 int res = pcap_next_ex(handle, &header, &packet);
+				std::cout << "res = " << res << "\n";
                 if (res == 1) {
 					std::cout << "reading packet " << context->count << "\n";
                     std::copy(packet, packet + header->caplen, context->burst[context->count].begin());
@@ -79,7 +80,7 @@ int main(int argc, char *argv[]) {
             }
 
 			fc.stop();
-
+			
             return context;
         }};
 
